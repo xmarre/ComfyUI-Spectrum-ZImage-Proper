@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -121,13 +122,53 @@ def _signature_seq(values) -> tuple[Any, ...]:
     return tuple(out)
 
 
+def _callable_identity(obj: Any) -> tuple[Any, ...]:
+    if isinstance(obj, functools.partial):
+        return (
+            "partial",
+            _callable_identity(obj.func),
+            _signature_seq(obj.args),
+            tuple(sorted((str(k), repr(v)) for k, v in (obj.keywords or {}).items())),
+        )
+
+    func = getattr(obj, "__func__", None)
+    self_obj = getattr(obj, "__self__", None)
+    if func is not None and self_obj is not None:
+        return (
+            "bound_method",
+            getattr(func, "__module__", type(func).__module__),
+            getattr(func, "__qualname__", getattr(func, "__name__", type(func).__qualname__)),
+            type(self_obj).__module__,
+            type(self_obj).__qualname__,
+            id(self_obj),
+        )
+
+    module = getattr(obj, "__module__", None)
+    qualname = getattr(obj, "__qualname__", None)
+    name = getattr(obj, "__name__", None)
+    if module is not None and (qualname is not None or name is not None):
+        return ("callable", module, qualname or name)
+
+    return (
+        "object",
+        type(obj).__module__,
+        type(obj).__qualname__,
+        id(obj),
+    )
+
+
 def _patches_signature(transformer_options: Dict[str, Any]) -> Optional[tuple[Any, ...]]:
     patches = transformer_options.get("patches")
     if not isinstance(patches, dict) or not patches:
         return None
     signature = []
     for key in sorted(patches.keys(), key=str):
-        signature.append((str(key), len(patches[key]) if hasattr(patches[key], "__len__") else None))
+        bucket = patches[key]
+        if isinstance(bucket, (list, tuple)):
+            bucket_signature = tuple(_callable_identity(patch) for patch in bucket)
+        else:
+            bucket_signature = (_callable_identity(bucket),)
+        signature.append((str(key), bucket_signature))
     return tuple(signature)
 
 
