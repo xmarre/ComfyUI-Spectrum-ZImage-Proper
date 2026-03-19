@@ -109,6 +109,28 @@ def _forecast_feature_sanitization_stats(feature: torch.Tensor, dtype: torch.dty
     }
 
 
+def _signature_seq(values) -> tuple[Any, ...]:
+    if values is None:
+        return ()
+    out = []
+    for value in values:
+        if isinstance(value, (str, int, float, bool, type(None))):
+            out.append(value)
+        else:
+            out.append(repr(value))
+    return tuple(out)
+
+
+def _patches_signature(transformer_options: Dict[str, Any]) -> Optional[tuple[Any, ...]]:
+    patches = transformer_options.get("patches")
+    if not isinstance(patches, dict) or not patches:
+        return None
+    signature = []
+    for key in sorted(patches.keys(), key=str):
+        signature.append((str(key), len(patches[key]) if hasattr(patches[key], "__len__") else None))
+    return tuple(signature)
+
+
 def _build_branch_signature(transformer_options: Dict[str, Any]) -> Optional[tuple[Any, ...]]:
     signature = []
     cond_or_uncond = transformer_options.get("cond_or_uncond")
@@ -119,8 +141,13 @@ def _build_branch_signature(transformer_options: Dict[str, Any]) -> Optional[tup
             signature.append(("cond_or_uncond", tuple(cond_or_uncond)))
 
     uuids = transformer_options.get("uuids")
-    if uuids is not None:
-        signature.append(("uuids_len", len(uuids)))
+    normalized_uuids = _signature_seq(uuids)
+    if normalized_uuids:
+        signature.append(("uuids", normalized_uuids))
+
+    patches_sig = _patches_signature(transformer_options)
+    if patches_sig is not None:
+        signature.append(("patches", patches_sig))
 
     if not signature:
         return None
@@ -389,6 +416,7 @@ def _run_zimage_forward_with_spectrum(
     )
     freqs_cis = freqs_cis.to(img.device)
     expected_feature_shape = tuple(img.shape)
+    branch_signature = _build_branch_signature(transformer_options)
 
     if step_ctx is not None:
         _, run_id, solver_step_id, actual_forward = step_ctx
@@ -396,13 +424,14 @@ def _run_zimage_forward_with_spectrum(
             run_id,
             solver_step_id,
             expected_shape=expected_feature_shape,
-            branch_signature=_build_branch_signature(transformer_options),
+            branch_signature=branch_signature,
         )
         if not actual_forward:
             pred_feature = runtime.predict_feature(
                 run_id,
                 solver_step_id,
                 expected_shape=expected_feature_shape,
+                branch_signature=branch_signature,
             )
             if pred_feature is not None:
                 if runtime.cfg.debug:
@@ -455,7 +484,12 @@ def _run_zimage_forward_with_spectrum(
                     img[:, :cap_size[0]] = out["txt"]
 
     if run_id is not None and solver_step_id is not None:
-        runtime.observe_actual_feature(run_id, solver_step_id, img)
+        runtime.observe_actual_feature_for_branch(
+            run_id,
+            solver_step_id,
+            img,
+            branch_signature=branch_signature,
+        )
 
     img = inner.final_layer(img, adaln_input, timestep_zero_index=timestep_zero_index)
     img = inner.unpatchify(img, img_size, cap_size, return_tensor=x_is_tensor)[:, :, :h, :w]

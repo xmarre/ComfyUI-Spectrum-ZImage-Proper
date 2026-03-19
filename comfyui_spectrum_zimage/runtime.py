@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import torch
@@ -34,16 +34,20 @@ class _ActiveRun:
 
 
 @dataclass(slots=True)
+class _ActiveSubcall:
+    signature: tuple[Any, ...]
+    expected_shape: Optional[tuple[int, ...]] = None
+    observed_actual: bool = False
+    used_forecast: bool = False
+    predicted_feature: Optional[torch.Tensor] = None
+
+
+@dataclass(slots=True)
 class _ActiveStep:
     solver_step_id: int
     time_coord: float
     decision: Dict[str, Any]
-    expected_shape: Optional[tuple[int, ...]] = None
-    branch_signature: Optional[tuple[Any, ...]] = None
-    hook_call_count: int = 0
-    observed_actual: bool = False
-    used_forecast: bool = False
-    predicted_feature: Optional[torch.Tensor] = None
+    subcalls: Dict[tuple[Any, ...], _ActiveSubcall] = field(default_factory=dict)
 
 
 class SpectrumRuntime:
@@ -57,6 +61,7 @@ class SpectrumRuntime:
         self.run_id = 0
         self.stats = RuntimeStats(current_window=float(self.cfg.window_size))
         self._active_run: Optional[_ActiveRun] = None
+        self._forecasters: Dict[tuple[Any, ...], ChebyshevSpectrumForecaster] = {}
         self._active_steps: Dict[int, _ActiveStep] = {}
         self._reset_scheduler_state()
 
@@ -88,6 +93,7 @@ class SpectrumRuntime:
         self.forecast_disabled = False
         self.forecast_disable_reason: Optional[str] = None
         self.forecaster.reset()
+        self._forecasters = {}
         self._active_steps = {}
         self.stats.current_window = float(self.cfg.window_size)
         self.stats.forecast_disabled = False
@@ -107,11 +113,56 @@ class SpectrumRuntime:
         self.num_consecutive_cached_steps = 0
         self.curr_ws = float(self.cfg.window_size)
         self.forecaster.reset()
+        self._forecasters = {}
         for step in self._active_steps.values():
-            step.predicted_feature = None
+            for subcall in step.subcalls.values():
+                subcall.predicted_feature = None
         self.stats.current_window = self.curr_ws
         self.stats.forecast_disabled = True
         self.stats.disable_reason = reason
+
+    def _normalize_branch_signature(self, branch_signature: Optional[tuple[Any, ...]]) -> tuple[Any, ...]:
+        if not branch_signature:
+            return (("__spectrum_default_branch__", True),)
+        return tuple(branch_signature)
+
+    def _get_or_create_branch_forecaster(self, signature: tuple[Any, ...]) -> ChebyshevSpectrumForecaster:
+        forecaster = self._forecasters.get(signature)
+        if forecaster is None:
+            forecaster = ChebyshevSpectrumForecaster(
+                degree=self.cfg.degree,
+                ridge_lambda=self.cfg.ridge_lambda,
+                max_history=self.cfg.max_history,
+            )
+            self._forecasters[signature] = forecaster
+        else:
+            forecaster.configure(
+                degree=self.cfg.degree,
+                ridge_lambda=self.cfg.ridge_lambda,
+                max_history=self.cfg.max_history,
+            )
+        return forecaster
+
+    def _get_branch_forecaster(self, signature: tuple[Any, ...]) -> Optional[ChebyshevSpectrumForecaster]:
+        return self._forecasters.get(signature)
+
+    def _require_subcall(
+        self,
+        step: _ActiveStep,
+        branch_signature: Optional[tuple[Any, ...]],
+    ) -> _ActiveSubcall:
+        if branch_signature is None:
+            default_signature = self._normalize_branch_signature(None)
+            default_subcall = step.subcalls.get(default_signature)
+            if default_subcall is not None:
+                return default_subcall
+            if len(step.subcalls) == 1:
+                return next(iter(step.subcalls.values()))
+        signature = self._normalize_branch_signature(branch_signature)
+        subcall = step.subcalls.get(signature)
+        if subcall is None:
+            raise RuntimeError(f"Spectrum branch signature {signature!r} is not active for solver step {step.solver_step_id}.")
+        return subcall
 
     def num_steps(self) -> int:
         if self.stats.total_steps > 0:
@@ -208,12 +259,11 @@ class SpectrumRuntime:
             not self.forecast_disabled
             and not tail_actual_only
             and int(solver_step_id) >= self.cfg.warmup_steps
-            and self.forecaster.ready(self.min_fit_points)
         ):
-            ws_floor = max(1, int(math.floor(self.curr_ws)))
+            ws_floor = max(1, math.floor(self.curr_ws))
             actual_forward = ((self.num_consecutive_cached_steps + 1) % ws_floor) == 0
 
-        if self.forecast_disabled or tail_actual_only or not self.forecaster.ready(self.min_fit_points):
+        if self.forecast_disabled or tail_actual_only:
             actual_forward = True
 
         decision = {
@@ -240,7 +290,7 @@ class SpectrumRuntime:
         return step.decision
 
     def step_used_forecast(self, run_id: int, solver_step_id: int) -> bool:
-        return self._require_active_step(run_id, solver_step_id).used_forecast
+        return any(subcall.used_forecast for subcall in self._require_active_step(run_id, solver_step_id).subcalls.values())
 
     def register_model_hook_call(
         self,
@@ -251,30 +301,49 @@ class SpectrumRuntime:
         branch_signature: Optional[tuple[Any, ...]] = None,
     ) -> None:
         step = self._require_active_step(run_id, solver_step_id)
-        step.hook_call_count += 1
-        if step.hook_call_count > 1:
-            self._disable_forecasting("multiple model-hook calls observed within one solver step")
-        if step.expected_shape is None:
-            step.expected_shape = tuple(expected_shape)
-        elif tuple(expected_shape) != step.expected_shape:
-            self._disable_forecasting("model-hook feature shape changed within one solver step")
-
-        if branch_signature is None:
+        signature = self._normalize_branch_signature(branch_signature)
+        subcall = step.subcalls.get(signature)
+        if subcall is not None:
+            self._disable_forecasting("same branch signature observed multiple times within one solver step")
             return
-        if step.branch_signature is None:
-            step.branch_signature = branch_signature
-        elif branch_signature != step.branch_signature:
-            self._disable_forecasting("model-hook branch signature changed within one solver step")
+
+        step.subcalls[signature] = _ActiveSubcall(
+            signature=signature,
+            expected_shape=tuple(expected_shape),
+        )
 
     def observe_actual_feature(self, run_id: int, solver_step_id: int, feature: torch.Tensor) -> None:
         step = self._require_active_step(run_id, solver_step_id)
-        step.observed_actual = True
-        step.used_forecast = False
-        step.predicted_feature = None
+        subcall = self._require_subcall(step, None)
+        subcall.observed_actual = True
+        subcall.used_forecast = False
+        subcall.predicted_feature = None
         if self.forecast_disabled:
             return
         try:
-            self.forecaster.update(step.time_coord, feature)
+            forecaster = self._get_or_create_branch_forecaster(subcall.signature)
+            forecaster.update(step.time_coord, feature)
+        except ValueError as exc:
+            self._disable_forecasting(str(exc))
+
+    def observe_actual_feature_for_branch(
+        self,
+        run_id: int,
+        solver_step_id: int,
+        feature: torch.Tensor,
+        *,
+        branch_signature: Optional[tuple[Any, ...]] = None,
+    ) -> None:
+        step = self._require_active_step(run_id, solver_step_id)
+        subcall = self._require_subcall(step, branch_signature)
+        subcall.observed_actual = True
+        subcall.used_forecast = False
+        subcall.predicted_feature = None
+        if self.forecast_disabled:
+            return
+        try:
+            forecaster = self._get_or_create_branch_forecaster(subcall.signature)
+            forecaster.update(step.time_coord, feature)
         except ValueError as exc:
             self._disable_forecasting(str(exc))
 
@@ -284,41 +353,51 @@ class SpectrumRuntime:
         solver_step_id: int,
         *,
         expected_shape: Optional[tuple[int, ...]] = None,
+        branch_signature: Optional[tuple[Any, ...]] = None,
     ) -> Optional[torch.Tensor]:
         step = self._require_active_step(run_id, solver_step_id)
         if step.decision["actual_forward"]:
             return None
-        if self.forecast_disabled or not self.forecaster.ready(self.min_fit_points):
+        subcall = self._require_subcall(step, branch_signature)
+        forecaster = self._get_branch_forecaster(subcall.signature)
+        if self.forecast_disabled or forecaster is None or not forecaster.ready(self.min_fit_points):
             return None
 
-        if step.predicted_feature is None:
-            step.predicted_feature = self.forecaster.predict(
+        if subcall.predicted_feature is None:
+            subcall.predicted_feature = forecaster.predict(
                 time_coord=step.time_coord,
                 blend_weight=self.cfg.blend_weight,
             )
 
-        if expected_shape is not None and tuple(step.predicted_feature.shape) != tuple(expected_shape):
+        if expected_shape is not None and tuple(subcall.predicted_feature.shape) != tuple(expected_shape):
             self._disable_forecasting("predicted feature shape did not match the current solver-step input")
             return None
 
-        step.used_forecast = True
-        return step.predicted_feature
+        subcall.used_forecast = True
+        return subcall.predicted_feature
 
     def finalize_solver_step(self, run_id: int, solver_step_id: int, *, used_forecast: bool) -> None:
         step = self._require_active_step(run_id, solver_step_id)
-        if bool(used_forecast):
-            step.used_forecast = True
-        if step.decision["actual_forward"] and not step.observed_actual:
+        any_actual = any(subcall.observed_actual for subcall in step.subcalls.values())
+        any_forecast = any(subcall.used_forecast for subcall in step.subcalls.values())
+
+        if len(step.subcalls) == 0:
+            self._disable_forecasting("solver step finished without any model-hook subcalls")
+        if step.decision["actual_forward"] and not any_actual:
             self._disable_forecasting("solver step requested an actual forward but no actual feature was observed")
-        if not step.observed_actual and not step.used_forecast:
+        if not any_actual and not any_forecast:
             self._disable_forecasting("solver step finished without an actual feature or a forecasted feature")
 
-        if step.used_forecast:
+        if any_forecast and not any_actual:
             self.num_consecutive_cached_steps += 1
             self.stats.forecasted_count += 1
             step.decision["actual_forward"] = False
         else:
-            if not self.forecast_disabled and step.solver_step_id >= self.cfg.warmup_steps:
+            if (
+                not self.forecast_disabled
+                and step.decision["actual_forward"]
+                and step.solver_step_id >= self.cfg.warmup_steps
+            ):
                 self.curr_ws = round(self.curr_ws + float(self.cfg.flex_window), 6)
             self.num_consecutive_cached_steps = 0
             self.stats.actual_forward_count += 1
