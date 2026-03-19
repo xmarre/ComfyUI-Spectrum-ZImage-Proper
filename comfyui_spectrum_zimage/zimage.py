@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import functools
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -109,6 +111,161 @@ def _forecast_feature_sanitization_stats(feature: torch.Tensor, dtype: torch.dty
     }
 
 
+def _signature_seq(values) -> tuple[Any, ...]:
+    if values is None:
+        return ()
+    out = []
+    for value in values:
+        if isinstance(value, (str, int, float, bool, type(None))):
+            out.append(value)
+        else:
+            out.append(repr(value))
+    return tuple(out)
+
+
+def _stable_value_fingerprint(value: Any):
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_stable_value_fingerprint(v) for v in value))
+    if isinstance(value, list):
+        return ("list", tuple(_stable_value_fingerprint(v) for v in value))
+    if isinstance(value, dict):
+        items = []
+        for key in sorted(value.keys(), key=repr):
+            items.append((repr(key), _stable_value_fingerprint(value[key])))
+        return ("dict", tuple(items))
+    return ("repr", type(value).__module__, type(value).__qualname__, repr(value))
+
+
+def _stable_instance_fingerprint(obj: Any) -> tuple[Any, ...]:
+    attrs = []
+
+    obj_dict = getattr(obj, "__dict__", None)
+    if isinstance(obj_dict, dict):
+        for key in sorted(obj_dict.keys(), key=str):
+            value = obj_dict[key]
+            if callable(value) or isinstance(value, torch.Tensor):
+                continue
+            attrs.append((str(key), _stable_value_fingerprint(value)))
+
+    slots = getattr(type(obj), "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    for slot in slots:
+        if slot in {"__dict__", "__weakref__"} or not hasattr(obj, slot):
+            continue
+        value = getattr(obj, slot)
+        if callable(value) or isinstance(value, torch.Tensor):
+            continue
+        attrs.append((str(slot), _stable_value_fingerprint(value)))
+
+    if attrs:
+        return (
+            "instance_state",
+            type(obj).__module__,
+            type(obj).__qualname__,
+            tuple(attrs),
+        )
+
+    return (
+        "instance_id",
+        type(obj).__module__,
+        type(obj).__qualname__,
+        id(obj),
+    )
+
+
+def _function_identity(fn: Any) -> tuple[Any, ...]:
+    code = getattr(fn, "__code__", None)
+    try:
+        closure_vars = inspect.getclosurevars(fn)
+        nonlocals_sig = tuple(
+            sorted(
+                (str(name), _stable_value_fingerprint(value))
+                for name, value in closure_vars.nonlocals.items()
+            )
+        )
+    except Exception:
+        nonlocals_sig = ()
+
+    defaults = getattr(fn, "__defaults__", None) or ()
+    kwdefaults = getattr(fn, "__kwdefaults__", None) or {}
+
+    return (
+        "function",
+        getattr(fn, "__module__", type(fn).__module__),
+        getattr(fn, "__qualname__", getattr(fn, "__name__", type(fn).__qualname__)),
+        getattr(code, "co_filename", None),
+        getattr(code, "co_firstlineno", None),
+        getattr(code, "co_name", None),
+        _signature_seq(defaults),
+        tuple(sorted((str(k), _stable_value_fingerprint(v)) for k, v in kwdefaults.items())),
+        nonlocals_sig,
+    )
+
+
+def _callable_identity(obj: Any) -> tuple[Any, ...]:
+    if isinstance(obj, functools.partial):
+        return (
+            "partial",
+            _callable_identity(obj.func),
+            _signature_seq(obj.args),
+            tuple(sorted((str(k), repr(v)) for k, v in (obj.keywords or {}).items())),
+        )
+
+    func = getattr(obj, "__func__", None)
+    self_obj = getattr(obj, "__self__", None)
+    if func is not None and self_obj is not None:
+        return (
+            "bound_method",
+            _function_identity(func),
+            _stable_instance_fingerprint(self_obj),
+        )
+
+    if inspect.isfunction(obj):
+        return _function_identity(obj)
+
+    call = getattr(obj, "__call__", None)
+    if call is not None and not inspect.isroutine(obj):
+        bound_call_func = getattr(call, "__func__", call)
+        return (
+            "callable_object",
+            type(obj).__module__,
+            type(obj).__qualname__,
+            _function_identity(bound_call_func) if inspect.isfunction(bound_call_func) else _callable_identity(bound_call_func),
+            _stable_instance_fingerprint(obj),
+        )
+
+    module = getattr(obj, "__module__", None)
+    qualname = getattr(obj, "__qualname__", None)
+    name = getattr(obj, "__name__", None)
+    if module is not None and (qualname is not None or name is not None):
+        return ("callable", module, qualname or name)
+
+    return (
+        "object",
+        type(obj).__module__,
+        type(obj).__qualname__,
+        id(obj),
+    )
+
+
+def _patches_signature(transformer_options: Dict[str, Any]) -> Optional[tuple[Any, ...]]:
+    patches = transformer_options.get("patches")
+    if not isinstance(patches, dict) or not patches:
+        return None
+    signature = []
+    for key in sorted(patches.keys(), key=str):
+        bucket = patches[key]
+        if isinstance(bucket, (list, tuple)):
+            bucket_signature = tuple(_callable_identity(patch) for patch in bucket)
+        else:
+            bucket_signature = (_callable_identity(bucket),)
+        signature.append((str(key), bucket_signature))
+    return tuple(signature)
+
+
 def _build_branch_signature(transformer_options: Dict[str, Any]) -> Optional[tuple[Any, ...]]:
     signature = []
     cond_or_uncond = transformer_options.get("cond_or_uncond")
@@ -119,8 +276,13 @@ def _build_branch_signature(transformer_options: Dict[str, Any]) -> Optional[tup
             signature.append(("cond_or_uncond", tuple(cond_or_uncond)))
 
     uuids = transformer_options.get("uuids")
-    if uuids is not None:
-        signature.append(("uuids_len", len(uuids)))
+    normalized_uuids = _signature_seq(uuids)
+    if normalized_uuids:
+        signature.append(("uuids", normalized_uuids))
+
+    patches_sig = _patches_signature(transformer_options)
+    if patches_sig is not None:
+        signature.append(("patches", patches_sig))
 
     if not signature:
         return None
@@ -389,6 +551,7 @@ def _run_zimage_forward_with_spectrum(
     )
     freqs_cis = freqs_cis.to(img.device)
     expected_feature_shape = tuple(img.shape)
+    branch_signature = _build_branch_signature(transformer_options)
 
     if step_ctx is not None:
         _, run_id, solver_step_id, actual_forward = step_ctx
@@ -396,13 +559,14 @@ def _run_zimage_forward_with_spectrum(
             run_id,
             solver_step_id,
             expected_shape=expected_feature_shape,
-            branch_signature=_build_branch_signature(transformer_options),
+            branch_signature=branch_signature,
         )
         if not actual_forward:
             pred_feature = runtime.predict_feature(
                 run_id,
                 solver_step_id,
                 expected_shape=expected_feature_shape,
+                branch_signature=branch_signature,
             )
             if pred_feature is not None:
                 if runtime.cfg.debug:
@@ -455,7 +619,12 @@ def _run_zimage_forward_with_spectrum(
                     img[:, :cap_size[0]] = out["txt"]
 
     if run_id is not None and solver_step_id is not None:
-        runtime.observe_actual_feature(run_id, solver_step_id, img)
+        runtime.observe_actual_feature_for_branch(
+            run_id,
+            solver_step_id,
+            img,
+            branch_signature=branch_signature,
+        )
 
     img = inner.final_layer(img, adaln_input, timestep_zero_index=timestep_zero_index)
     img = inner.unpatchify(img, img_size, cap_size, return_tensor=x_is_tensor)[:, :, :h, :w]

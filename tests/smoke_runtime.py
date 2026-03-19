@@ -14,6 +14,7 @@ from comfyui_spectrum_zimage.config import SpectrumConfig
 from comfyui_spectrum_zimage.forecast import ChebyshevSpectrumForecaster
 from comfyui_spectrum_zimage.runtime import SpectrumRuntime
 from comfyui_spectrum_zimage.zimage import (
+    _patches_signature,
     _SUPPORTED_SINGLE_EVAL_SAMPLERS,
     _forecast_feature_sanitization_stats,
     _sanitize_forecast_feature_for_final_layer,
@@ -239,11 +240,63 @@ def test_cross_step_feature_shape_mismatch_disables_forecast() -> None:
     runtime.end_run(run_id)
 
 
-def test_multiple_hook_calls_disable_forecast() -> None:
+def test_distinct_branch_signatures_within_one_solver_step_do_not_disable_forecast() -> None:
+    runtime = make_runtime(degree=1, warmup_steps=2)
+    sample_sigmas = torch.linspace(1.0, 0.0, 51)
+    run_id = runtime.start_run(sample_sigmas, "sample_euler", supports_solver_steps=True)
+    total_steps = len(sample_sigmas) - 1
+
+    branch_a = (("cond_or_uncond", (0,)), ("uuids", ("cond-a",)))
+    branch_b = (("cond_or_uncond", (1,)), ("uuids", ("uncond-b",)))
+
+    for step_id in range(2):
+        decision = runtime.begin_solver_step(
+            run_id,
+            step_id,
+            runtime.time_coord_for_step(step_id),
+            total_steps,
+        )
+        assert decision["actual_forward"] is True
+
+        runtime.register_model_hook_call(run_id, step_id, expected_shape=(1, 1), branch_signature=branch_a)
+        runtime.observe_actual_feature_for_branch(
+            run_id, step_id, torch.tensor([[1.0 + step_id]], dtype=torch.float32), branch_signature=branch_a
+        )
+
+        runtime.register_model_hook_call(run_id, step_id, expected_shape=(1, 1), branch_signature=branch_b)
+        runtime.observe_actual_feature_for_branch(
+            run_id, step_id, torch.tensor([[10.0 + step_id]], dtype=torch.float32), branch_signature=branch_b
+        )
+
+        runtime.finalize_solver_step(decision["run_id"], decision["solver_step_id"], used_forecast=False)
+
+    decision = runtime.begin_solver_step(
+        run_id,
+        2,
+        runtime.time_coord_for_step(2),
+        total_steps,
+    )
+    assert decision["actual_forward"] is False
+
+    runtime.register_model_hook_call(run_id, 2, expected_shape=(1, 1), branch_signature=branch_a)
+    assert runtime.predict_feature(run_id, 2, expected_shape=(1, 1), branch_signature=branch_a) is not None
+
+    runtime.register_model_hook_call(run_id, 2, expected_shape=(1, 1), branch_signature=branch_b)
+    assert runtime.predict_feature(run_id, 2, expected_shape=(1, 1), branch_signature=branch_b) is not None
+
+    runtime.finalize_solver_step(decision["run_id"], decision["solver_step_id"], used_forecast=True)
+    assert runtime.stats.forecast_disabled is False
+    assert runtime.stats.forecasted_count == 1
+    assert runtime.stats.actual_forward_count == 2
+    runtime.end_run(run_id)
+
+
+def test_repeated_same_branch_signature_within_one_solver_step_do_not_disable_forecast() -> None:
     runtime = make_runtime()
     sample_sigmas = torch.linspace(1.0, 0.0, 51)
     run_id = runtime.start_run(sample_sigmas, "sample_euler", supports_solver_steps=True)
     total_steps = len(sample_sigmas) - 1
+    branch_signature = (("cond_or_uncond", (0, 1)),)
 
     for step_id in range(5):
         decision = runtime.begin_solver_step(
@@ -252,8 +305,20 @@ def test_multiple_hook_calls_disable_forecast() -> None:
             runtime.time_coord_for_step(step_id),
             total_steps,
         )
-        runtime.register_model_hook_call(run_id, step_id, expected_shape=(1, 8, 4))
-        runtime.observe_actual_feature(run_id, step_id, torch.randn(1, 8, 4))
+        runtime.register_model_hook_call(run_id, step_id, expected_shape=(1, 8, 4), branch_signature=branch_signature)
+        runtime.observe_actual_feature_for_branch(
+            run_id,
+            step_id,
+            torch.randn(1, 8, 4),
+            branch_signature=branch_signature,
+        )
+        runtime.register_model_hook_call(run_id, step_id, expected_shape=(1, 8, 4), branch_signature=branch_signature)
+        runtime.observe_actual_feature_for_branch(
+            run_id,
+            step_id,
+            torch.randn(1, 8, 4),
+            branch_signature=branch_signature,
+        )
         runtime.finalize_solver_step(run_id, step_id, used_forecast=False)
 
     decision = runtime.begin_solver_step(
@@ -262,12 +327,19 @@ def test_multiple_hook_calls_disable_forecast() -> None:
         runtime.time_coord_for_step(5),
         total_steps,
     )
-    runtime.register_model_hook_call(run_id, 5, expected_shape=(1, 8, 4))
-    runtime.register_model_hook_call(run_id, 5, expected_shape=(1, 8, 4))
-    assert runtime.stats.forecast_disabled is True
-    assert runtime.stats.disable_reason == "multiple model-hook calls observed within one solver step"
-    runtime.observe_actual_feature(run_id, 5, torch.randn(1, 8, 4))
-    runtime.finalize_solver_step(decision["run_id"], decision["solver_step_id"], used_forecast=False)
+    assert decision["actual_forward"] is False
+
+    runtime.register_model_hook_call(run_id, 5, expected_shape=(1, 8, 4), branch_signature=branch_signature)
+    pred_a = runtime.predict_feature(run_id, 5, expected_shape=(1, 8, 4), branch_signature=branch_signature)
+    assert pred_a is not None
+
+    runtime.register_model_hook_call(run_id, 5, expected_shape=(1, 8, 4), branch_signature=branch_signature)
+    pred_b = runtime.predict_feature(run_id, 5, expected_shape=(1, 8, 4), branch_signature=branch_signature)
+    assert pred_b is not None
+
+    runtime.finalize_solver_step(decision["run_id"], decision["solver_step_id"], used_forecast=True)
+    assert runtime.stats.forecast_disabled is False
+    assert runtime.stats.forecasted_count == 1
     runtime.end_run(run_id)
 
 
@@ -362,6 +434,31 @@ def test_forecast_sanitizer_clamps_and_reports() -> None:
     sanitized = _sanitize_forecast_feature_for_final_layer(feature, torch.float16)
     assert sanitized.dtype == torch.float16
     assert torch.isfinite(sanitized).all()
+
+
+def test_patches_signature_distinguishes_same_count_different_closures() -> None:
+    def make_patch(scale):
+        def patch(payload):
+            return scale + len(payload)
+        return patch
+
+    patches_a = {"double_block": [make_patch(1)]}
+    patches_b = {"double_block": [make_patch(2)]}
+
+    sig_a = _patches_signature({"patches": patches_a})
+    sig_b = _patches_signature({"patches": patches_b})
+    assert sig_a != sig_b
+
+
+def test_patches_signature_distinguishes_same_count_different_partials() -> None:
+    import functools
+
+    def patch(payload, scale=0):
+        return scale + len(payload)
+
+    sig_a = _patches_signature({"patches": {"double_block": [functools.partial(patch, scale=1)]}})
+    sig_b = _patches_signature({"patches": {"double_block": [functools.partial(patch, scale=2)]}})
+    assert sig_a != sig_b
 
 
 def run_all() -> None:
