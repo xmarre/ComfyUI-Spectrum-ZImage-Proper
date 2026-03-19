@@ -47,6 +47,8 @@ class _ActiveStep:
     solver_step_id: int
     time_coord: float
     decision: Dict[str, Any]
+    subcall_counts: Dict[tuple[Any, ...], int] = field(default_factory=dict)
+    latest_subcall_key_by_signature: Dict[tuple[Any, ...], tuple[Any, ...]] = field(default_factory=dict)
     subcalls: Dict[tuple[Any, ...], _ActiveSubcall] = field(default_factory=dict)
 
 
@@ -146,6 +148,11 @@ class SpectrumRuntime:
     def _get_branch_forecaster(self, signature: tuple[Any, ...]) -> Optional[ChebyshevSpectrumForecaster]:
         return self._forecasters.get(signature)
 
+    def _branch_occurrence_key(self, signature: tuple[Any, ...], occurrence_index: int) -> tuple[Any, ...]:
+        if occurrence_index <= 0:
+            return signature
+        return signature + (("__spectrum_occurrence__", occurrence_index),)
+
     def _require_subcall(
         self,
         step: _ActiveStep,
@@ -153,16 +160,26 @@ class SpectrumRuntime:
     ) -> _ActiveSubcall:
         if branch_signature is None:
             default_signature = self._normalize_branch_signature(None)
-            default_subcall = step.subcalls.get(default_signature)
+            default_subcall_key = step.latest_subcall_key_by_signature.get(default_signature, default_signature)
+            default_subcall = step.subcalls.get(default_subcall_key)
             if default_subcall is not None:
                 return default_subcall
             if len(step.subcalls) == 1:
                 return next(iter(step.subcalls.values()))
         signature = self._normalize_branch_signature(branch_signature)
-        subcall = step.subcalls.get(signature)
+        subcall_key = step.latest_subcall_key_by_signature.get(signature)
+        if subcall_key is None:
+            subcall_key = signature
+        subcall = step.subcalls.get(subcall_key)
         if subcall is None:
             raise RuntimeError(f"Spectrum branch signature {signature!r} is not active for solver step {step.solver_step_id}.")
         return subcall
+
+    def _any_branch_ready(self) -> bool:
+        for forecaster in self._forecasters.values():
+            if forecaster.ready(self.min_fit_points):
+                return True
+        return False
 
     def num_steps(self) -> int:
         if self.stats.total_steps > 0:
@@ -259,11 +276,12 @@ class SpectrumRuntime:
             not self.forecast_disabled
             and not tail_actual_only
             and int(solver_step_id) >= self.cfg.warmup_steps
+            and self._any_branch_ready()
         ):
             ws_floor = max(1, math.floor(self.curr_ws))
             actual_forward = ((self.num_consecutive_cached_steps + 1) % ws_floor) == 0
 
-        if self.forecast_disabled or tail_actual_only:
+        if self.forecast_disabled or tail_actual_only or not self._any_branch_ready():
             actual_forward = True
 
         decision = {
@@ -302,13 +320,13 @@ class SpectrumRuntime:
     ) -> None:
         step = self._require_active_step(run_id, solver_step_id)
         signature = self._normalize_branch_signature(branch_signature)
-        subcall = step.subcalls.get(signature)
-        if subcall is not None:
-            self._disable_forecasting("same branch signature observed multiple times within one solver step")
-            return
+        occurrence_index = step.subcall_counts.get(signature, 0)
+        step.subcall_counts[signature] = occurrence_index + 1
+        subcall_key = self._branch_occurrence_key(signature, occurrence_index)
+        step.latest_subcall_key_by_signature[signature] = subcall_key
 
-        step.subcalls[signature] = _ActiveSubcall(
-            signature=signature,
+        step.subcalls[subcall_key] = _ActiveSubcall(
+            signature=subcall_key,
             expected_shape=tuple(expected_shape),
         )
 
