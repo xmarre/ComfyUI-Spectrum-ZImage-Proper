@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import functools
 import logging
 from typing import Any, Dict, Optional, Tuple
@@ -122,6 +123,88 @@ def _signature_seq(values) -> tuple[Any, ...]:
     return tuple(out)
 
 
+def _stable_value_fingerprint(value: Any):
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_stable_value_fingerprint(v) for v in value))
+    if isinstance(value, list):
+        return ("list", tuple(_stable_value_fingerprint(v) for v in value))
+    if isinstance(value, dict):
+        items = []
+        for key in sorted(value.keys(), key=repr):
+            items.append((repr(key), _stable_value_fingerprint(value[key])))
+        return ("dict", tuple(items))
+    return ("repr", type(value).__module__, type(value).__qualname__, repr(value))
+
+
+def _stable_instance_fingerprint(obj: Any) -> tuple[Any, ...]:
+    attrs = []
+
+    obj_dict = getattr(obj, "__dict__", None)
+    if isinstance(obj_dict, dict):
+        for key in sorted(obj_dict.keys(), key=str):
+            value = obj_dict[key]
+            if callable(value) or isinstance(value, torch.Tensor):
+                continue
+            attrs.append((str(key), _stable_value_fingerprint(value)))
+
+    slots = getattr(type(obj), "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    for slot in slots:
+        if slot in {"__dict__", "__weakref__"} or not hasattr(obj, slot):
+            continue
+        value = getattr(obj, slot)
+        if callable(value) or isinstance(value, torch.Tensor):
+            continue
+        attrs.append((str(slot), _stable_value_fingerprint(value)))
+
+    if attrs:
+        return (
+            "instance_state",
+            type(obj).__module__,
+            type(obj).__qualname__,
+            tuple(attrs),
+        )
+
+    return (
+        "instance_id",
+        type(obj).__module__,
+        type(obj).__qualname__,
+        id(obj),
+    )
+
+
+def _function_identity(fn: Any) -> tuple[Any, ...]:
+    code = getattr(fn, "__code__", None)
+    try:
+        closure_vars = inspect.getclosurevars(fn)
+        nonlocals_sig = tuple(
+            sorted(
+                (str(name), _stable_value_fingerprint(value))
+                for name, value in closure_vars.nonlocals.items()
+            )
+        )
+    except Exception:
+        nonlocals_sig = ()
+
+    defaults = getattr(fn, "__defaults__", None) or ()
+    kwdefaults = getattr(fn, "__kwdefaults__", None) or {}
+
+    return (
+        "function",
+        getattr(fn, "__module__", type(fn).__module__),
+        getattr(fn, "__qualname__", getattr(fn, "__name__", type(fn).__qualname__)),
+        getattr(code, "co_filename", None),
+        getattr(code, "co_firstlineno", None),
+        getattr(code, "co_name", None),
+        _signature_seq(defaults),
+        tuple(sorted((str(k), _stable_value_fingerprint(v)) for k, v in kwdefaults.items())),
+        nonlocals_sig,
+    )
+
+
 def _callable_identity(obj: Any) -> tuple[Any, ...]:
     if isinstance(obj, functools.partial):
         return (
@@ -136,11 +219,22 @@ def _callable_identity(obj: Any) -> tuple[Any, ...]:
     if func is not None and self_obj is not None:
         return (
             "bound_method",
-            getattr(func, "__module__", type(func).__module__),
-            getattr(func, "__qualname__", getattr(func, "__name__", type(func).__qualname__)),
-            type(self_obj).__module__,
-            type(self_obj).__qualname__,
-            id(self_obj),
+            _function_identity(func),
+            _stable_instance_fingerprint(self_obj),
+        )
+
+    if inspect.isfunction(obj):
+        return _function_identity(obj)
+
+    call = getattr(obj, "__call__", None)
+    if call is not None and not inspect.isroutine(obj):
+        bound_call_func = getattr(call, "__func__", call)
+        return (
+            "callable_object",
+            type(obj).__module__,
+            type(obj).__qualname__,
+            _function_identity(bound_call_func) if inspect.isfunction(bound_call_func) else _callable_identity(bound_call_func),
+            _stable_instance_fingerprint(obj),
         )
 
     module = getattr(obj, "__module__", None)

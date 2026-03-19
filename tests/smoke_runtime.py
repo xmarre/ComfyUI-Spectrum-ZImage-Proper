@@ -14,6 +14,7 @@ from comfyui_spectrum_zimage.config import SpectrumConfig
 from comfyui_spectrum_zimage.forecast import ChebyshevSpectrumForecaster
 from comfyui_spectrum_zimage.runtime import SpectrumRuntime
 from comfyui_spectrum_zimage.zimage import (
+    _patches_signature,
     _SUPPORTED_SINGLE_EVAL_SAMPLERS,
     _forecast_feature_sanitization_stats,
     _sanitize_forecast_feature_for_final_layer,
@@ -433,6 +434,31 @@ def test_forecast_sanitizer_clamps_and_reports() -> None:
     sanitized = _sanitize_forecast_feature_for_final_layer(feature, torch.float16)
     assert sanitized.dtype == torch.float16
     assert torch.isfinite(sanitized).all()
+
+
+def test_patches_signature_distinguishes_same_count_different_closures() -> None:
+    def make_patch(scale):
+        def patch(payload):
+            return scale + len(payload)
+        return patch
+
+    patches_a = {"double_block": [make_patch(1)]}
+    patches_b = {"double_block": [make_patch(2)]}
+
+    sig_a = _patches_signature({"patches": patches_a})
+    sig_b = _patches_signature({"patches": patches_b})
+    assert sig_a != sig_b
+
+
+def test_patches_signature_distinguishes_same_count_different_partials() -> None:
+    import functools
+
+    def patch(payload, scale=0):
+        return scale + len(payload)
+
+    sig_a = _patches_signature({"patches": {"double_block": [functools.partial(patch, scale=1)]}})
+    sig_b = _patches_signature({"patches": {"double_block": [functools.partial(patch, scale=2)]}})
+    assert sig_a != sig_b
 
 
 def run_all() -> None:
