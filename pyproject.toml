@@ -1,0 +1,20 @@
+[project]
+name = "comfyui-spectrum-zimage-proper"
+description = "Faithful Z-Image-focused ComfyUI port of Spectrum spectral feature forecasting."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
+
+[tool.comfy]
+PublisherId = "local"
+DisplayName = "ComfyUI-Spectrum-ZImage-Proper"
+Icon = ""
+includes = []
