@@ -34,8 +34,11 @@ class SpectrumConfig:
             raise ValueError("warmup_steps must be >= 0.")
         if int(self.tail_actual_steps) < 0:
             raise ValueError("tail_actual_steps must be >= 0.")
-        if int(self.max_history) < max(8, int(self.degree) + 1):
-            raise ValueError("max_history must be at least max(8, degree + 1).")
+        min_history = max(8, int(self.degree) + 1)
+        if int(self.max_history) < min_history:
+            raise ValueError(
+                f"max_history ({int(self.max_history)}) must be at least max(8, degree + 1) = {min_history}."
+            )
         return self
 
     def to_dict(self) -> dict:

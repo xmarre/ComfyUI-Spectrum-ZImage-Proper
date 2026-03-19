@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "comfyui-spectrum-zimage-proper"
 description = "Faithful Z-Image-focused ComfyUI port of Spectrum spectral feature forecasting."
@@ -13,8 +17,13 @@ classifiers = [
   "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
 ]
 
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-Spectrum-ZImage-Proper"
+Documentation = "https://github.com/xmarre/ComfyUI-Spectrum-ZImage-Proper/wiki"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-Spectrum-ZImage-Proper/issues"
+
 [tool.comfy]
-PublisherId = "local"
+PublisherId = "xmarre"
 DisplayName = "ComfyUI-Spectrum-ZImage-Proper"
 Icon = ""
 includes = []

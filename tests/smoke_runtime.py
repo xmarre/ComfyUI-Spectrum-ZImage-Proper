@@ -111,10 +111,11 @@ def test_forecast_fallback_reconciles_bookkeeping() -> None:
     runtime.observe_actual_feature(run_id, 5, torch.randn(1, 8, 4))
     runtime.finalize_solver_step(run_id, 5, used_forecast=False)
 
+    assert runtime.stats.forecast_disabled is True
+    assert runtime.stats.disable_reason == "predicted feature shape did not match the current solver-step input"
     assert runtime.stats.forecasted_count == 0
     assert runtime.stats.actual_forward_count == 6
     assert runtime.num_consecutive_cached_steps == 0
-    assert decision["actual_forward"] is True
     assert runtime.curr_ws == before_window
     runtime.end_run(run_id)
 
